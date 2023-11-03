@@ -762,8 +762,10 @@ void __sched mutex_unlock(struct mutex *lock)
 {
 	trace_android_vh_record_mutex_lock_starttime(current, 0);
 #ifndef CONFIG_DEBUG_LOCK_ALLOC
-	if (__mutex_unlock_fast(lock))
+	if (__mutex_unlock_fast(lock)) {
+		trace_android_vh_record_mutex_lock_starttime(current, 0);
 		return;
+	}
 #endif
 	__mutex_unlock_slowpath(lock, _RET_IP_);
 }

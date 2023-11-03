@@ -489,8 +489,8 @@ retry:
 		 */
 		dev->mode_config.delayed_event = true;
 		if (dev->mode_config.poll_enabled)
-			queue_delayed_work(system_power_efficient_wq, 
-								&dev->mode_config.output_poll_work, 0);
+			queue_delayed_work(system_power_efficient_wq,
+								&dev->mode_config.output_poll_work, 0);0.r1-16500-kernel.0
 	}
 
 	/* Re-enable polling in case the global poll config changed. */
@@ -709,7 +709,7 @@ out:
 
 
 	if (repoll)
-		queue_delayed_work(system_power_efficient_wq, delayed_work, 
+		queue_delayed_work(system_power_efficient_wq, delayed_work,
 							DRM_OUTPUT_POLL_PERIOD);
 }
 
@@ -877,4 +877,3 @@ bool drm_helper_hpd_irq_event(struct drm_device *dev)
 	return changed;
 }
 EXPORT_SYMBOL(drm_helper_hpd_irq_event);
-

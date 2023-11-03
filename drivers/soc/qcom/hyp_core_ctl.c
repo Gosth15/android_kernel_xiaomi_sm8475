@@ -36,6 +36,8 @@
 static DEFINE_PER_CPU(struct freq_qos_request, qos_min_req);
 static DEFINE_PER_CPU(unsigned int, qos_min_freq);
 
+static cpumask_t nonselected_cpus;
+static int default_cpus = 1;
 static unsigned int gh_suspend_timeout_ms = 1000;
 /**
  * struct hyp_core_ctl_cpumap - vcpu to pcpu mapping for the other guest
@@ -728,6 +730,44 @@ static inline bool is_tuivm(gh_vmid_t vmid)
 	return false;
 }
 
+static void get_mpidr_cpu(void *cpu)
+{
+	u64 mpidr = read_cpuid_mpidr() & MPIDR_HWID_BITMASK;
+
+	*((uint32_t *)cpu) = MPIDR_AFFINITY_LEVEL(mpidr, 1);
+}
+
+/* populate_cpus - to store the logical-physical cpu mapping,
+ * useful when we have non one-one cpu mapping.
+ */
+void populate_cpus(void)
+{
+	uint32_t cpu, pcpu;
+	int i;
+
+	for (i = 0; i < NR_CPUS; i++)
+		logical_cpu[i] = -1;
+
+	for_each_possible_cpu(cpu) {
+		smp_call_function_single(cpu, get_mpidr_cpu,
+							&pcpu, true);
+		physical_cpu[cpu] = pcpu;
+		logical_cpu[pcpu] = cpu;
+	}
+	for (i = 0; i < 8; i++)
+		pr_debug("logical_cpu[%d]=%d, physical_cpu[%d]=%d\n"
+				, i, logical_cpu[i], i, physical_cpu[i]);
+}
+
+
+bool check_phys_cpu(int cpu_idx)
+{
+	if (cpu_phys_to_logical(cpu_idx) == -1)
+		return false;
+	else
+		return true;
+}
+
 /*
  * Called when vm_status is STATUS_READY, multiple times before status
  * moves to STATUS_RUNNING
@@ -755,15 +795,30 @@ static int gh_vcpu_populate_affinity_info(gh_vmid_t vmid, gh_label_t cpu_idx, gh
 	}
 
 	if (!is_vcpu_info_populated) {
+		if (populate_need) {
+			if (!check_phys_cpu(cpu_idx)) {
+				cpumask_clear(&hcd_isolate->cpus_to_isolate);
+				default_cpus = 0;
+			} else {
+				cpumask_set_cpu(cpu_phys_to_logical(cpu_idx),
+						&hcd_isolate->cpus_to_isolate);
+			}
+		} else {
+			if (!check_phys_cpu(cpu_idx)) {
+				pr_err("physical CPU %u not present.\n", cpu_idx);
+				ret = -ENXIO;
+				goto out;
+			}
+		}
 		gh_cpumap[nr_vcpus].cap_id = cap_id;
 		gh_cpumap[nr_vcpus].pcpu = cpu_idx;
 		gh_cpumap[nr_vcpus].curr_pcpu = cpu_idx;
-
+		pr_debug("cpu_index:%u vcpu_cap_id:%llu vcpu:%d nr_vcpus:%d\n",
+				cpu_idx, cap_id, nr_vcpus, nr_vcpus+1);
 		nr_vcpus++;
 		pr_debug("cpu_index:%u vcpu_cap_id:%llu nr_vcpus:%d\n",
 					cpu_idx, cap_id, nr_vcpus);
 	}
-
 out:
 	return ret;
 }
@@ -794,11 +849,106 @@ out:
 	return 0;
 }
 
+static void hyp_core_ctl_unisolate_work(struct work_struct *work)
+{
+	struct hyp_core_ctl_isolation *priv;
+	int cpu, ret;
+
+	priv = container_of(work, struct hyp_core_ctl_isolation, unisolation_work);
+
+	if (wait_for_completion_interruptible(&priv->isolation_done))
+		pr_err("%s: CPU unisolation is interrupted\n", __func__);
+
+	for_each_cpu(cpu, &hcd_isolate->isolated_cpus) {
+		ret = add_cpu(cpu);
+		if (ret) {
+			pr_err("fail to online logical CPU%d. ret=%d\n", cpu, ret);
+			continue;
+		}
+		pr_info("%s: onlined logical cpu: %d\n", __func__, cpu);
+		cpumask_clear_cpu(cpu, &hcd_isolate->isolated_cpus);
+	}
+
+	kfree(priv);
+}
+
+void hyp_core_ctl_isolate_cpus(void)
+{
+	int cpu, ret;
+
+	if (!hcd_isolate) {
+		pr_err("cannot allocate memory for hcd_isolate\n");
+		return;
+	}
+	schedule_work(&hcd_isolate->unisolation_work);
+	for_each_cpu_and(cpu, &hcd_isolate->cpus_to_isolate, cpu_online_mask) {
+		ret = remove_cpu(cpu);
+		if (ret) {
+			pr_err("fail to offline logical CPUS%d. ret=%d\n", cpu, ret);
+			continue;
+		}
+		pr_info("%s: offlined logical cpu : %d\n", __func__, cpu);
+		cpumask_set_cpu(cpu, &hcd_isolate->isolated_cpus);
+	}
+	mod_timer(&hcd_isolate->hyp_core_ctl_cpu_isolate_timer, jiffies
+			+ msecs_to_jiffies(hcd_isolate->hyp_core_ctl_unisolate_timeout));
+}
+
+/* find_alternate_best_cpus_and_affine - To find out what would be the best cpus
+ * to schedule the vcpus threads and trigger hyp call to set affinity on those cpus.
+ * - Gold CPUs are preferred over silver.
+ * - Prime CPUs would not be preferred anyway due to high power
+ * consumption.
+ * - 1 Gold and 1 Silver is preferred if and Only if 1 Gold and N silvers are
+ * present.
+ * - 2 Silvers are preferred, if no Golds are present.
+ */
+
+static int find_alternate_best_cpus_and_affine(unsigned long cap_id, int *cpu,
+					cpumask_t *nonselected_cpus, int nr_vcpus)
+{
+	cpumask_t tempmask;
+	cpumask_t setbits;
+	int ret = 0;
+
+	cpumask_copy(&tempmask, nonselected_cpus);
+	if (topology_physical_package_id(cpumask_last(&tempmask)) == 2)
+		cpumask_andnot(&setbits, &tempmask, topology_core_cpumask(cpumask_last(&tempmask)));
+	else
+		cpumask_copy(&setbits, &tempmask);
+
+	*cpu = cpu_logical_to_phys(cpumask_last(&setbits));
+
+	cpumask_clear_cpu(cpumask_last(&setbits), &setbits);
+	cpumask_copy(nonselected_cpus, &setbits);
+
+	if (!(*cpu)) {
+		pr_err("no cpu selected for vcpu=%d\n", nr_vcpus);
+		ret = -ENXIO;
+	} else {
+		ret = gh_hcall_vcpu_affinity_set(cap_id, *cpu);
+		if (ret) {
+			pr_err("fail to assign pcpu for vcpu# err=%d cap_id=%llu pcpu=%d\n",
+						ret, cap_id, *cpu);
+			ret = -ENXIO;
+		} else {
+			pr_debug("affinity successfully set to physical_cpu=%u for vcpu=%d\n",
+							*cpu, nr_vcpus);
+		}
+		pr_debug("selected best lcpu=%d for vcpu=%d\n",
+				cpu_phys_to_logical(*cpu), nr_vcpus);
+		cpumask_set_cpu(cpu_phys_to_logical(*cpu), &hcd_isolate->cpus_to_isolate);
+	}
+	return ret;
+}
+
 static int gh_vcpu_done_populate_affinity_info(struct notifier_block *nb,
 						unsigned long cmd, void *data)
 {
 	struct gh_rm_notif_vm_status_payload *vm_status_payload = data;
 	u8 vm_status = vm_status_payload->vm_status;
+	int temp_nr_vcpus = nr_vcpus;
+	int ret = 0;
 
 	if (!is_tuivm(vm_status_payload->vmid)) {
 		pr_info("Reservation scheme skipped for other VM vmid%d\n",
@@ -806,7 +956,32 @@ static int gh_vcpu_done_populate_affinity_info(struct notifier_block *nb,
 		goto out;
 	}
 
-	if (cmd == GH_RM_NOTIF_VM_STATUS &&
+	/* We are replicating the same mechanism to isolate the cpus during
+	 * bootup time as was done by guestvm loader, this is actually needed
+	 * to have a clean solution as hyp_core_ctl is having all the
+	 * vcpus information and this would only exercise when we have populate-cpus
+	 * DT property set for hyp_core_ctl.
+	 */
+	if (cmd == GH_RM_NOTIF_VM_STATUS && vm_status == GH_RM_VM_STATUS_READY) {
+		if (populate_need && is_tuivm(vm_status_payload->vmid)) {
+			if (!default_cpus) {
+				mutex_lock(&the_hcd->reservation_mutex);
+				while (temp_nr_vcpus--) {
+					ret = find_alternate_best_cpus_and_affine(
+							gh_cpumap[temp_nr_vcpus].cap_id,
+							&gh_cpumap[temp_nr_vcpus].pcpu,
+							&nonselected_cpus, temp_nr_vcpus);
+					if (ret) {
+						pr_err("failed to find and affine cpus\n");
+						mutex_unlock(&the_hcd->reservation_mutex);
+						return ret;
+					}
+				}
+				mutex_unlock(&the_hcd->reservation_mutex);
+			}
+			hyp_core_ctl_isolate_cpus();
+		}
+	} else if (cmd == GH_RM_NOTIF_VM_STATUS &&
 			vm_status == GH_RM_VM_STATUS_RUNNING &&
 			!is_vcpu_info_populated) {
 		mutex_lock(&the_hcd->reservation_mutex);
