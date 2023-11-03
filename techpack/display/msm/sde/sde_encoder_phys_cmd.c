@@ -210,7 +210,7 @@ static void sde_encoder_phys_cmd_pp_tx_done_irq(void *arg, int irq_idx)
 	struct sde_hw_ctl *ctl;
 	u32 scheduler_status = INVALID_CTL_STATUS, event = 0;
 
-	if (!phys_enc || !phys_enc->hw_pp)
+	if (!phys_enc || !phys_enc->hw_pp || !phys_enc->hw_ctl)
 		return;
 
 	cmd_enc = to_sde_encoder_phys_cmd(phys_enc);
@@ -231,7 +231,7 @@ static void sde_encoder_phys_cmd_pp_tx_done_irq(void *arg, int irq_idx)
 		spin_unlock(phys_enc->enc_spinlock);
 	}
 
-	if (ctl && ctl->ops.get_scheduler_status)
+	if (ctl->ops.get_scheduler_status)
 		scheduler_status = ctl->ops.get_scheduler_status(ctl);
 
 	SDE_EVT32_IRQ(DRMID(phys_enc->parent),
