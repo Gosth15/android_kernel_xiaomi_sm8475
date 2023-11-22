@@ -2631,7 +2631,6 @@ static int dwc3_gadget_pullup(struct usb_gadget *g, int is_on)
 		ret = dwc3_gadget_run_stop(dwc, true, false);
 	}
 
-done:
 	pm_runtime_put(dwc->dev);
 
 	return ret;
