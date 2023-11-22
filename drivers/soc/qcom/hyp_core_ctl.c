@@ -23,6 +23,7 @@
 #include <linux/cpufreq.h>
 #include <linux/cpu.h>
 
+#include <linux/arch_topology.h>
 #include <linux/gunyah/gh_errno.h>
 #include <linux/gunyah/gh_rm_drv.h>
 #include "hcall_core_ctl.h"
@@ -32,6 +33,8 @@
 #define MAX_RESERVE_CPUS (num_possible_cpus()/2)
 #define SVM_STATE_RUNNING 1
 #define SVM_STATE_SYSTEM_SUSPENDED 3
+#define DEFAULT_UNISO_TIMEOUT_MS 12000
+#define INVALID_VALUE -1
 
 static DEFINE_PER_CPU(struct freq_qos_request, qos_min_req);
 static DEFINE_PER_CPU(unsigned int, qos_min_freq);
@@ -39,6 +42,23 @@ static DEFINE_PER_CPU(unsigned int, qos_min_freq);
 static cpumask_t nonselected_cpus;
 static int default_cpus = 1;
 static unsigned int gh_suspend_timeout_ms = 1000;
+static uint32_t physical_cpu[NR_CPUS];
+static bool populate_need;
+static uint32_t logical_cpu[NR_CPUS];
+#define cpu_phys_to_logical(cpu) logical_cpu[cpu] //get_logical_cpu
+#define cpu_logical_to_phys(cpu) physical_cpu[cpu] //get_physical_cpu
+
+struct hyp_core_ctl_isolation {
+	struct timer_list hyp_core_ctl_cpu_isolate_timer;
+	struct completion isolation_done;
+	struct work_struct unisolation_work;
+	u32 hyp_core_ctl_unisolate_timeout;
+	cpumask_t cpus_to_isolate;
+	cpumask_t isolated_cpus;
+};
+
+struct hyp_core_ctl_isolation *hcd_isolate;
+
 /**
  * struct hyp_core_ctl_cpumap - vcpu to pcpu mapping for the other guest
  * @cap_id: System call id to be used while referring to this vcpu
@@ -48,6 +68,7 @@ static unsigned int gh_suspend_timeout_ms = 1000;
  *             CPU i.e pcpu can't be used due to thermal condition.
  *
  */
+
 struct hyp_core_ctl_cpu_map {
 	gh_capid_t cap_id;
 	gh_label_t pcpu;
@@ -64,10 +85,10 @@ struct hyp_core_ctl_cpu_map {
  *                     reservation. The physical CPUs are re-assigned
  *                     during thermal conditions while reservation is
  *                     not enabled. So this synchronization is needed.
- * @reserve_cpus: The CPUs to be reserved. input.
- * @our_paused_cpus: The CPUs paused by hyp_core_ctl driver. output.
- * @final_reserved_cpus: The CPUs reserved for the Hypervisor. output.
- * @cpumap: The vcpu to pcpu mapping table
+ * @reserve_cpus: The logical CPUs to be reserved. input.
+ * @our_paused_cpus: The logical CPUs paused by hyp_core_ctl driver. output.
+ * @final_reserved_cpus: The logical CPUs reserved for the Hypervisor. output.
+ * @cpumap: The vcpu to pcpu mapping table, physical cpus
  */
 struct hyp_core_ctl_data {
 	spinlock_t lock;
@@ -144,7 +165,7 @@ static void hyp_core_ctl_undo_reservation(struct hyp_core_ctl_data *hcd)
 	for_each_cpu(cpu, &hcd->our_paused_cpus) {
 		ret = resume_cpu(cpu);
 		if (ret < 0) {
-			pr_err("fail to un-pause CPU%d. ret=%d\n", cpu, ret);
+			pr_err("fail to un-pause logical CPU%d. ret=%d\n", cpu, ret);
 			continue;
 		}
 
@@ -155,7 +176,7 @@ static void hyp_core_ctl_undo_reservation(struct hyp_core_ctl_data *hcd)
 			ret = freq_qos_update_request(qos_req,
 					FREQ_QOS_MIN_DEFAULT_VALUE);
 			if (ret < 0)
-				pr_err("fail to update min freq for CPU%d ret=%d\n",
+				pr_err("fail to update min freq for logical CPU%d ret=%d\n",
 								cpu, ret);
 		}
 	}
@@ -206,8 +227,8 @@ static void finalize_reservation(struct hyp_core_ctl_data *hcd, cpumask_t *temp)
 		if (hcd->cpumap[i].cap_id == GH_CAPID_INVAL)
 			break;
 
-		orig_cpu = hcd->cpumap[i].pcpu;
-		curr_cpu = hcd->cpumap[i].curr_pcpu;
+		orig_cpu = cpu_phys_to_logical(hcd->cpumap[i].pcpu);
+		curr_cpu = cpu_phys_to_logical(hcd->cpumap[i].curr_pcpu);
 
 		if (cpumask_test_cpu(orig_cpu, &hcd->final_reserved_cpus)) {
 			cpumask_clear_cpu(orig_cpu, temp);
@@ -221,14 +242,15 @@ static void finalize_reservation(struct hyp_core_ctl_data *hcd, cpumask_t *temp)
 			 * the assignment.
 			 */
 			err = gh_hcall_vcpu_affinity_set(hcd->cpumap[i].cap_id,
-								orig_cpu);
+								cpu_logical_to_phys(orig_cpu));
 			if (err != GH_ERROR_OK) {
-				pr_err("restore: fail to assign pcpu for vcpu#%d err=%d cap_id=%llu cpu=%d\n",
-					i, err, hcd->cpumap[i].cap_id, orig_cpu);
+				pr_err("restore: fail to assign pcpu for vcpu#%d err=%d cap_id=%llu pcpu=%d and equivalent lcpu=%d\n",
+						i, err, hcd->cpumap[i].cap_id,
+						cpu_logical_to_phys(orig_cpu), orig_cpu);
 				continue;
 			}
 
-			hcd->cpumap[i].curr_pcpu = orig_cpu;
+			hcd->cpumap[i].curr_pcpu = cpu_logical_to_phys(orig_cpu);
 			pr_debug("err=%u vcpu=%d pcpu=%u curr_cpu=%u\n",
 					err, i, hcd->cpumap[i].pcpu,
 					hcd->cpumap[i].curr_pcpu);
@@ -266,14 +288,15 @@ static void finalize_reservation(struct hyp_core_ctl_data *hcd, cpumask_t *temp)
 		cpumask_clear_cpu(replacement_cpu, temp);
 
 		err = gh_hcall_vcpu_affinity_set(hcd->cpumap[i].cap_id,
-							replacement_cpu);
+							cpu_logical_to_phys(replacement_cpu));
 		if (err != GH_ERROR_OK) {
-			pr_err("adjust: fail to assign pcpu for vcpu#%d err=%d cap_id=%llu cpu=%d\n",
-				i, err, hcd->cpumap[i].cap_id, replacement_cpu);
+			pr_err("adjust: fail to assign pcpu for vcpu#%d err=%d cap_id=%llu pcpu=%d and equivalent lcpu=%d\n",
+				i, err, hcd->cpumap[i].cap_id, cpu_logical_to_phys(replacement_cpu),
+				replacement_cpu);
 			continue;
 		}
 
-		hcd->cpumap[i].curr_pcpu = replacement_cpu;
+		hcd->cpumap[i].curr_pcpu = cpu_logical_to_phys(replacement_cpu);
 		pr_debug("adjust err=%u vcpu=%d pcpu=%u curr_cpu=%u\n",
 				err, i, hcd->cpumap[i].pcpu,
 				hcd->cpumap[i].curr_pcpu);
@@ -314,7 +337,7 @@ static void hyp_core_ctl_do_reservation(struct hyp_core_ctl_data *hcd)
 
 		ret = pause_cpu(i);
 		if (ret < 0) {
-			pr_debug("fail to pause CPU%d. ret=%d\n", i, ret);
+			pr_debug("fail to pause logical CPU%d. ret=%d\n", i, ret);
 			continue;
 		}
 
@@ -325,7 +348,7 @@ static void hyp_core_ctl_do_reservation(struct hyp_core_ctl_data *hcd)
 			qos_req = &per_cpu(qos_min_req, i);
 			ret = freq_qos_update_request(qos_req, min_freq);
 			if (ret < 0)
-				pr_err("fail to update min freq for CPU%d ret=%d\n",
+				pr_err("fail to update min freq for logical CPU%d ret=%d\n",
 								i, ret);
 		}
 	}
@@ -373,7 +396,7 @@ static void hyp_core_ctl_do_reservation(struct hyp_core_ctl_data *hcd)
 		for_each_cpu(i, &iter_cpus) {
 			ret = pause_cpu(i);
 			if (ret < 0) {
-				pr_debug("fail to pause CPU%d. ret=%d\n",
+				pr_debug("fail to pause logical CPU%d. ret=%d\n",
 						i, ret);
 				continue;
 			}
@@ -386,7 +409,7 @@ static void hyp_core_ctl_do_reservation(struct hyp_core_ctl_data *hcd)
 				ret = freq_qos_update_request(qos_req,
 								min_freq);
 				if (ret < 0)
-					pr_err("fail to update min freq for CPU%d ret=%d\n",
+					pr_err("fail to update min freq for logical CPU%d ret=%d\n",
 								i, ret);
 			}
 
@@ -420,7 +443,7 @@ static void hyp_core_ctl_do_reservation(struct hyp_core_ctl_data *hcd)
 		for_each_cpu(i, &iter_cpus) {
 			ret = resume_cpu(i);
 			if (ret < 0) {
-				pr_err("fail to unpause CPU%d. ret=%d\n",
+				pr_err("fail to unpause logical CPU%d. ret=%d\n",
 				       i, ret);
 				continue;
 			}
@@ -432,7 +455,7 @@ static void hyp_core_ctl_do_reservation(struct hyp_core_ctl_data *hcd)
 				ret = freq_qos_update_request(qos_req,
 						FREQ_QOS_MIN_DEFAULT_VALUE);
 				if (ret < 0)
-					pr_err("fail to update min freq for CPU%d ret=%d\n",
+					pr_err("fail to update min freq for logical CPU%d ret=%d\n",
 								i, ret);
 			}
 
@@ -577,7 +600,7 @@ static int hyp_core_ctl_cpu_cooling_cb(struct notifier_block *nb,
 		if (cpumask_test_cpu(cpu, &the_hcd->our_paused_cpus)) {
 			ret = resume_cpu(cpu);
 			if (ret < 0) {
-				pr_err("fail to unpause CPU%d. ret=%d\n",
+				pr_err("fail to unpause logical CPU%d. ret=%d\n",
 				       cpu, ret);
 				goto out;
 			}
@@ -587,7 +610,7 @@ static int hyp_core_ctl_cpu_cooling_cb(struct notifier_block *nb,
 				ret = freq_qos_update_request(qos_req,
 						FREQ_QOS_MIN_DEFAULT_VALUE);
 				if (ret < 0)
-					pr_err("fail to update min freq for CPU%d ret=%d\n",
+					pr_err("fail to update min freq for logical CPU%d ret=%d\n",
 								cpu, ret);
 			}
 		}
@@ -647,7 +670,7 @@ static int hyp_core_ctl_hp_offline(unsigned int cpu)
 			ret = freq_qos_update_request(qos_req,
 					FREQ_QOS_MIN_DEFAULT_VALUE);
 			if (ret < 0)
-				pr_err("fail to update min freq for CPU%d ret=%d\n",
+				pr_err("fail to update min freq for logical CPU%d ret=%d\n",
 								cpu, ret);
 		}
 	}
@@ -691,8 +714,10 @@ static void hyp_core_ctl_init_reserve_cpus(struct hyp_core_ctl_data *hcd)
 		hcd->cpumap[i].cap_id = gh_cpumap[i].cap_id;
 		hcd->cpumap[i].pcpu = gh_cpumap[i].pcpu;
 		hcd->cpumap[i].curr_pcpu = gh_cpumap[i].curr_pcpu;
-		cpumask_set_cpu(hcd->cpumap[i].pcpu, &hcd->reserve_cpus);
-		pr_debug("vcpu%u map to pcpu%u\n", i, hcd->cpumap[i].pcpu);
+		cpumask_set_cpu(cpu_phys_to_logical(hcd->cpumap[i].pcpu),
+						&hcd->reserve_cpus);
+		pr_debug("vcpu%u map to pcpu%u and equivalent lcpu%u\n"
+			, i, hcd->cpumap[i].pcpu, cpu_phys_to_logical(hcd->cpumap[i].pcpu));
 	}
 
 	cpumask_copy(&hcd->final_reserved_cpus, &hcd->reserve_cpus);
@@ -816,8 +841,6 @@ static int gh_vcpu_populate_affinity_info(gh_vmid_t vmid, gh_label_t cpu_idx, gh
 		pr_debug("cpu_index:%u vcpu_cap_id:%llu vcpu:%d nr_vcpus:%d\n",
 				cpu_idx, cap_id, nr_vcpus, nr_vcpus+1);
 		nr_vcpus++;
-		pr_debug("cpu_index:%u vcpu_cap_id:%llu nr_vcpus:%d\n",
-					cpu_idx, cap_id, nr_vcpus);
 	}
 out:
 	return ret;
@@ -1412,6 +1435,17 @@ static void hyp_core_ctl_debugfs_init(void)
 		debugfs_remove(dir);
 }
 
+static void hyp_core_ctl_timer_callback(struct timer_list *t)
+{
+	struct hyp_core_ctl_isolation *priv;
+
+	priv = container_of(t, struct hyp_core_ctl_isolation,
+				hyp_core_ctl_cpu_isolate_timer);
+
+	pr_err("%s: expired VM app status not set\n", __func__);
+	complete(&priv->isolation_done);
+}
+
 static int hyp_core_ctl_reg_rm_cbs(void)
 {
 	int ret = -EINVAL;
@@ -1451,6 +1485,30 @@ static int hyp_core_ctl_probe(struct platform_device *pdev)
 	int ret, i;
 	struct hyp_core_ctl_data *hcd;
 	struct sched_param param = { .sched_priority = MAX_RT_PRIO - 1 };
+
+	populate_need = of_property_read_bool(pdev->dev.of_node,
+							"qcom,populate-cpus");
+	if (populate_need) {
+		hcd_isolate = kzalloc(sizeof(struct hyp_core_ctl_isolation)
+									, GFP_KERNEL);
+		if (hcd_isolate) {
+			init_completion(&hcd_isolate->isolation_done);
+			timer_setup(&hcd_isolate->hyp_core_ctl_cpu_isolate_timer,
+						 hyp_core_ctl_timer_callback, 0);
+			INIT_WORK(&hcd_isolate->unisolation_work,
+						 hyp_core_ctl_unisolate_work);
+			ret = of_property_read_u32(pdev->dev.of_node, "qcom,unisolate-timeout-ms",
+						    &hcd_isolate->hyp_core_ctl_unisolate_timeout);
+			if (ret) {
+				pr_warn("%s: no unisolate timeout specified\n", __func__);
+				hcd_isolate->hyp_core_ctl_unisolate_timeout =
+							DEFAULT_UNISO_TIMEOUT_MS;
+			}
+		}
+	}
+
+	populate_cpus();
+	cpumask_copy(&nonselected_cpus, cpu_possible_mask);
 
 	ret = hyp_core_ctl_reg_rm_cbs();
 	if (ret)
