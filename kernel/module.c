@@ -3572,7 +3572,7 @@ static bool blacklisted(const char *module_name)
     int i;
 
 	if (!module_blacklist)
-		got custom_blacklist;
+		goto custom_blacklist;
 
 	for (p = module_blacklist; *p; p += len) {
 		len = strcspn(p, ",");
