@@ -6613,7 +6613,7 @@ CONFIG_NVMEM_SPMI_SDAM=m
 #
 # HW tracing support
 #
-CONFIG_STM=m
+# CONFIG_STM is not set
 # CONFIG_STM_PROTO_SYS_T is not set
 # CONFIG_STM_DUMMY is not set
 # CONFIG_STM_SOURCE_HEARTBEAT is not set
