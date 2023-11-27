@@ -70,6 +70,7 @@ banner
 build_mondrian
 cp_modules
 error.log
+modulos_correctos
 
 #
 # RPM spec file (make rpm-pkg)
