@@ -83,7 +83,9 @@ struct chmap_pdata {
 static int qos_vote_status;
 static struct dev_pm_qos_request latency_pm_qos_req; /* pm_qos request */
 static unsigned int qos_client_active_cnt;
-static int cluster_first_cpu[MAX_CPU_CLUSTER] = {-1, };
+/* set audio task affinity to core 1 & 2 */
+static const unsigned int audio_core_list[] = {0, 1, 2, 3, 4, 5};
+static cpumask_t audio_cpu_map = CPU_MASK_NONE;
 static struct dev_pm_qos_request *msm_audio_req = NULL;
 static bool kregister_pm_qos_latency_controls = false;
 #define MSM_LL_QOS_VALUE	300 /* time in us to ensure LPM doesn't go in C3/C4 */

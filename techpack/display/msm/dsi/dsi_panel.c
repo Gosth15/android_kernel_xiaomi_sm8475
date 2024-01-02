@@ -848,7 +848,7 @@ int dsi_panel_set_backlight(struct dsi_panel *panel, u32 bl_lvl)
 		rc = dsi_panel_update_backlight(panel, bl_lvl);
 		break;
 	case DSI_BACKLIGHT_EXTERNAL:
-		if(mi_get_panel_id(panel->mi_cfg.mi_panel_id) == M80_PANEL_PA || 
+		if(mi_get_panel_id(panel->mi_cfg.mi_panel_id) == M80_PANEL_PA ||
 			mi_get_panel_id(panel->mi_cfg.mi_panel_id) == PANEL_ID_INVALID) {
 			rc = ktz8866_backlight_update_status(bl_lvl);
 		}
@@ -5154,7 +5154,7 @@ int dsi_panel_set_lp2(struct dsi_panel *panel)
 	if (panel->mi_cfg.panel_state == PANEL_STATE_DOZE_HIGH
 		|| panel->mi_cfg.panel_state == PANEL_STATE_DOZE_LOW
 		|| panel->mi_cfg.aod_to_normal_status == true) {
-		DSI_DEBUG("panel already in aod mode, skip set DSI_CMD_SET_LP2\n");
+		DSI_INFO("panel already in aod mode, skip set DSI_CMD_SET_LP2\n");
 		goto exit;
 	} else {
 		need_set_doze = true;
@@ -5861,7 +5861,7 @@ error:
 
 
 	if (mi_get_panel_id_by_dsi_panel(panel) == M16T_PANEL_PA ||
-            	mi_get_panel_id_by_dsi_panel(panel) == M16T_PANEL_PB || 
+            	mi_get_panel_id_by_dsi_panel(panel) == M16T_PANEL_PB ||
             	mi_get_panel_id_by_dsi_panel(panel) == N16_PANEL_PA ||
             	mi_get_panel_id_by_dsi_panel(panel) == N16_PANEL_PB) {
 		rc = dsi_panel_gamma_switch_locked(panel);

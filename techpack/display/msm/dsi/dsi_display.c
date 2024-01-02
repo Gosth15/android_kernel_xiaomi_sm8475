@@ -5185,7 +5185,7 @@ static int dsi_display_get_dfps_timing(struct dsi_display *display,
 			adj_mode->timing.v_front_porch = 1972;
 			adj_mode->timing.h_front_porch = 130;
 		}
-	}else{ 
+	}else{
 		switch (dfps_caps.type) {
 		case DSI_DFPS_IMMEDIATE_VFP:
 			rc = dsi_display_dfps_calc_front_porch(
@@ -7953,7 +7953,7 @@ int dsi_display_set_mode(struct dsi_display *display,
 	}
 
 	display->panel->mi_cfg.last_fps = display->panel->cur_mode->timing.refresh_rate;
-	
+
 	rc = dsi_display_validate_mode_set(display, &adj_mode, flags);
 	if (rc) {
 		DSI_ERR("[%s] mode cannot be set\n", display->name);
@@ -7965,7 +7965,7 @@ int dsi_display_set_mode(struct dsi_display *display,
 		DSI_ERR("[%s] failed to set mode\n", display->name);
 		goto error;
 	}
-		DSI_DEBUG("mdp_transfer_time=%d, hactive=%d, hbp=%d , hsw=%d, hfp=%d, hskew=%d, vactive=%d, vbp=%d , vsw=%d, vfp=%d, fps=%d, clk_rate=%u\n",
+		DSI_INFO("mdp_transfer_time=%d, hactive=%d, hbp=%d , hsw=%d, hfp=%d, hskew=%d, vactive=%d, vbp=%d , vsw=%d, vfp=%d, fps=%d, clk_rate=%u\n",
 		adj_mode.priv_info->mdp_transfer_time_us,
 		timing.h_active,timing.h_back_porch, timing.h_sync_width,  timing.h_front_porch, timing.h_skew,
 		timing.v_active, timing.v_back_porch, timing.v_sync_width,  timing.v_front_porch,

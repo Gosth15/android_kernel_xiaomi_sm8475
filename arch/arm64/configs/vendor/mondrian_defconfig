@@ -1,7 +1,3 @@
-#
-# Automatically generated file; DO NOT EDIT.
-# Linux/arm64 5.10.168 Kernel Configuration
-#
 CONFIG_CC_VERSION_TEXT="Android (11039501, +pgo, +bolt, +lto, +mlgo, based on r498229b) clang version 17.0.4 (https://android.googlesource.com/toolchain/llvm-project e34ed7d63863b45858e74126edaa738e75887800)"
 CONFIG_GCC_VERSION=0
 CONFIG_LD_VERSION=0
